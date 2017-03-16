@@ -74,14 +74,17 @@ MODULE_PARM_DESC(dctcp_clamp_alpha_on_loss,
 
 static struct tcp_congestion_ops dctcp_reno;
 
-/* 
+/* Calculates p = alpha ^ d in D2TCP.
+ *
  * alpha should be in [0, 1024], corresponding to [0, 1] in D2TCP.
  * d should be in [64, 256], corresponding to [0.5, 2] in D2TCP.
- * 
+ *
  * The 1-D exp_results array stores the results, in which every consecutive
  * 193 elements, starting at the indices that are multiple of 193,
  * correspond to one value of alpha and 193 values of d (64 to 256).
  * So exp(alpha, d) = exp_results[193 * alpha + d - 64].
+ *
+ * Return value is in [0, 1024], corresponding to [0, 1] in D2TCP.
  */
 static inline u32 exp(u32 alpha, u16 d) {
 	return exp_results[(alpha << 7) + (alpha << 6) + alpha + d - 64];
