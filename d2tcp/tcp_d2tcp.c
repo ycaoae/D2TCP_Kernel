@@ -74,22 +74,6 @@ MODULE_PARM_DESC(dctcp_clamp_alpha_on_loss,
 
 static struct tcp_congestion_ops dctcp_reno;
 
-/* Calculates p = alpha ^ d in D2TCP.
- *
- * alpha should be in [0, 1024], corresponding to [0, 1] in D2TCP.
- * d should be in [64, 256], corresponding to [0.5, 2] in D2TCP.
- *
- * The 1-D exp_results array stores the results, in which every consecutive
- * 193 elements, starting at the indices that are multiple of 193,
- * correspond to one value of alpha and 193 values of d (64 to 256).
- * So exp(alpha, d) = exp_results[193 * alpha + d - 64].
- *
- * Return value is in [0, 1024], corresponding to [0, 1] in D2TCP.
- */
-static inline u32 exp(u32 alpha, u16 d) {
-	return exp_results[(alpha << 7) + (alpha << 6) + alpha + d - 64];
-}
-
 static void dctcp_reset(const struct tcp_sock *tp, struct dctcp *ca)
 {
 	ca->next_seq = tp->snd_nxt;
@@ -126,29 +110,36 @@ static void dctcp_init(struct sock *sk)
 	INET_ECN_dontxmit(sk);
 }
 
+/* Calculates p = alpha ^ d in D2TCP.
+ *
+ * alpha should be in [0, 1024], corresponding to [0, 1] in D2TCP.
+ * d should be in [64, 256], corresponding to [0.5, 2] in D2TCP.
+ *
+ * The 1-D exp_results array stores the results, in which every consecutive
+ * 193 elements, starting at the indices that are multiple of 193,
+ * correspond to one value of alpha and 193 values of d (64 to 256).
+ * So exp(alpha, d) = exp_results[193 * alpha + d - 64].
+ *
+ * Return value is in [0, 1024], corresponding to [0, 1] in D2TCP.
+ */
+static inline u32 d2tcp_exp(u32 alpha, u16 d)
+{
+	return exp_results[(alpha << 7) + (alpha << 6) + alpha + d - 64];
+}
+
 static u32 dctcp_ssthresh(struct sock *sk)
 {
 	const struct dctcp *ca = inet_csk_ca(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
-
-	//return max(tp->snd_cwnd - ((tp->snd_cwnd * ca->dctcp_alpha) >> 11U), 2U);
-
-	// Start of modification for D2TCP.
-	u32 alpha;
-	u16 random; // Temporary substitute for d.
 	u32 p;
+	u16 d;
 
-	alpha = ca -> dctcp_alpha;
-	
-	get_random_bytes(&random, sizeof(u16));
-	random &= 255U; // random %= 256.
-	random = ((random << 2U) - random) >> 2U; // random *= 0.75.
-	random += 64; // random now 64 to 255, corresponding to 0.5 to 2 of d in D2TCP.
-	
-	p = exp(alpha, random);
-	
+	d = 64;
+	d = min_t(u16, max_t(u16, d, 64), 256);	//ensure d in [64, 256] -> [0.5, 2]
+	p = d2tcp_exp(ca->dctcp_alpha, d);	//p = alpha ^ d
+
 	return max(tp->snd_cwnd - ((tp->snd_cwnd * p) >> 11U), 2U);
-	// End of modification for D2TCP.
+	//return max(tp->snd_cwnd - ((tp->snd_cwnd * ca->dctcp_alpha) >> 11U), 2U);
 }
 
 /* Minimal DCTP CE state machine:
