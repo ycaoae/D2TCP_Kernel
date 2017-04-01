@@ -40,13 +40,17 @@
  * your option) any later version.
  */
 
-#include <linux/module.h>
-#include <linux/mm.h>
-#include <net/tcp.h>
 #include <linux/inet_diag.h>
+#include <linux/mm.h>
+#include <linux/module.h>
+#include <linux/netlink.h>
+#include <linux/skbuff.h>
+#include <net/sock.h>
+#include <net/tcp.h>
 #include "table.h"
 
 #define DCTCP_MAX_ALPHA	1024U
+#define NETLINK_D2TCP 31
 
 struct dctcp {
 	u32 acked_bytes_ecn;
@@ -57,6 +61,12 @@ struct dctcp {
 	u32 next_seq;
 	u32 ce_state;
 	u32 delayed_ack_reserved;
+};
+
+// Encapsulation for easy future modification.
+struct d2tcp_ctrl_msg {
+	u32 ddl;
+	u32 total_num_bytes;
 };
 
 static unsigned int dctcp_shift_g __read_mostly = 4; /* g = 1/2^4 */
@@ -73,6 +83,8 @@ MODULE_PARM_DESC(dctcp_clamp_alpha_on_loss,
 		 "parameter for clamping alpha on loss");
 
 static struct tcp_congestion_ops dctcp_reno;
+
+struct sock *nl_sk = NULL;
 
 static void dctcp_reset(const struct tcp_sock *tp, struct dctcp *ca)
 {
@@ -108,6 +120,34 @@ static void dctcp_init(struct sock *sk)
 	 */
 	inet_csk(sk)->icsk_ca_ops = &dctcp_reno;
 	INET_ECN_dontxmit(sk);
+}
+
+static void recv_d2tcp_ctrl_msg(struct sk_buff *skb) {
+
+	struct nlmsghdr *nlh;
+	int pid;
+	struct sk_buff *skb_out;
+	struct d2tcp_ctrl_msg *recv_payload;
+	struct d2tcp_ctrl_msg echo_payload; // echo to ACK the ctrl msg.
+
+	nlh = (struct nlmsghdr*) skb->data;
+	recv_payload = (struct d2tcp_ctrl_msg*) nlmsg_data(nlh);
+	// TODO: store value from recv_payload to hash table.
+	echo_payload.ddl = recv_payload->ddl;
+	echo_payload.total_num_bytes = recv_payload->total_num_bytes;
+	pid = nlh->nlmsg_pid;
+
+	skb_out = nlmsg_new(sizeof(struct d2tcp_ctrl_msg), 0);
+	if(unlikely(!skb_out))
+	{
+		printk(KERN_ERR "Failed to allocate new skb\n");
+		return;
+	}
+
+	nlh = nlmsg_put(skb_out, 0, 0, NLMSG_DONE, sizeof(struct d2tcp_ctrl_msg), 0);  
+	NETLINK_CB(skb_out).dst_group = 0;
+	memcpy(nlmsg_data(nlh), &echo_payload, sizeof(struct d2tcp_ctrl_msg));
+	nlmsg_unicast(nl_sk, skb_out, pid);
 }
 
 /* Calculates p = alpha ^ d in D2TCP.
@@ -349,12 +389,22 @@ static struct tcp_congestion_ops dctcp_reno __read_mostly = {
 
 static int __init dctcp_register(void)
 {
+	struct netlink_kernel_cfg cfg = {
+		.input = recv_d2tcp_ctrl_msg,
+	};
+	nl_sk = netlink_kernel_create(&init_net, NETLINK_D2TCP, &cfg);
+	if (!nl_sk)
+	{
+		printk(KERN_ALERT "Error creating socket.\n");
+	}
+
 	BUILD_BUG_ON(sizeof(struct dctcp) > ICSK_CA_PRIV_SIZE);
 	return tcp_register_congestion_control(&dctcp);
 }
 
 static void __exit dctcp_unregister(void)
 {
+	netlink_kernel_release(nl_sk);
 	tcp_unregister_congestion_control(&dctcp);
 }
 
