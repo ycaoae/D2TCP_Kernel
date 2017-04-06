@@ -144,7 +144,7 @@ static void recv_d2tcp_ctrl_msg(struct sk_buff *skb) {
 		return;
 	}
 
-	nlh = nlmsg_put(skb_out, 0, 0, NLMSG_DONE, sizeof(struct d2tcp_ctrl_msg), 0);  
+	nlh = nlmsg_put(skb_out, 0, 0, NLMSG_DONE, sizeof(struct d2tcp_ctrl_msg), 0);
 	NETLINK_CB(skb_out).dst_group = 0;
 	memcpy(nlmsg_data(nlh), &echo_payload, sizeof(struct d2tcp_ctrl_msg));
 	nlmsg_unicast(nl_sk, skb_out, pid);
