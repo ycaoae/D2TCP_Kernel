@@ -40,14 +40,23 @@
  * your option) any later version.
  */
 
+#include <linux/hashtable.h>
 #include <linux/inet_diag.h>
+#include <linux/ip.h>
+#include <linux/kernel.h>
 #include <linux/mm.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
+#include <linux/netfilter_ipv4.h>
 #include <linux/netlink.h>
 #include <linux/skbuff.h>
+#include <linux/tcp.h>
+#include <linux/types.h>
 #include <net/sock.h>
 #include <net/tcp.h>
-#include "table.h"
+
+#include "crc_table.h"
+#include "exp_table.h"
 
 #define DCTCP_MAX_ALPHA	1024U
 #define NETLINK_D2TCP 31
@@ -63,10 +72,24 @@ struct dctcp {
 	u32 delayed_ack_reserved;
 };
 
-// Encapsulation for easy future modification.
-struct d2tcp_ctrl_msg {
-	u32 ddl;
-	u32 total_num_bytes;
+struct ctrl_msg {
+	u32 saddr;
+	u32 daddr;
+	u16 sport;
+	u16 dport;
+	u32 size;
+	u32 time_to_ddl;
+}
+
+struct flow_info {
+	u32 saddr;
+	u32 daddr;
+	u16 sport;
+	u16 dport;
+	u32 curr_seq;
+	u32 target_seq;
+	ktime_t end_time;
+	struct hlist_node hash_list;
 };
 
 static unsigned int dctcp_shift_g __read_mostly = 4; /* g = 1/2^4 */
@@ -82,9 +105,155 @@ module_param(dctcp_clamp_alpha_on_loss, uint, 0644);
 MODULE_PARM_DESC(dctcp_clamp_alpha_on_loss,
 		 "parameter for clamping alpha on loss");
 
+int param_port __read_mostly = 0;
+MODULE_PARM_DESC(param_port, "Port to match (0=all)");
+module_param(param_port, int, 0);
+
 static struct tcp_congestion_ops dctcp_reno;
 
+DEFINE_HASHTABLE(hash_table, 8);
+
 struct sock *nl_sk = NULL;
+
+static int seq_after(u32 seq1, u32 seq2)
+{
+	return (s32) (seq1 - seq2) > 0;
+}
+
+static u16 crc16(u32 saddr, u32 daddr, u16 sport, u16 dport)
+{
+	u16 id_segments[6] = {saddr >> 16, saddr & 0xffff, sport,
+			      daddr >> 16, daddr & 0xffff, dport};
+	unsigned char *byte_ptr = (unsigned char*) id_segments;
+	u16 hash_code = 0;
+	int i;
+	for (i = 0; i < 12; i++)
+		hash_code = (hash_code << 8) ^
+			    CRC_HASH_TABLE[(hash_code >> 8) ^ byte_ptr[i]];
+	return hash_code;
+}
+
+static void insert_to_table(u32 saddr, u32 daddr,
+			    u16 sport, u16 dport, u32 curr_seq)
+{
+	u16 hash_key = crc16(saddr, daddr, sport, dport);
+	struct flow_info *object;
+
+	hash_for_each_possible(hash_table, object, hash_list, hash_key) {
+		if (object->saddr == saddr && object->daddr == daddr &&
+		    object->sport == sport && object->dport == dport &&
+		    seq_after(seq, object->curr_seq)) {
+			object->curr_seq = seq;
+			return;
+		}
+	}
+
+	object = kmalloc(sizeof(struct flow_info), GFP_ATOMIC);
+	if (likely(object)) {
+		object->saddr = saddr;
+		object->daddr = daddr;
+		object->sport = sport;
+		object->dport = dport;
+		object->curr_seq = seq;
+		hash_add(hash_table, &(object->hash_list), hash_key); 
+	}
+}
+
+static void delete_from_table(u32 saddr, u32 daddr, u16 sport, u16 dport)
+{
+	u16 hash_key = crc16(saddr, daddr, sport, dport);
+	struct flow_info *object;
+
+	hash_for_each_possible(hash_table, object, hash_list, hash_key) {
+		if (object->saddr == cpu_saddr && object->daddr == cpu_daddr &&
+		    object->sport == cpu_sport && object->dport == cpu_dport) {
+			hash_del(&(object->hash_list));
+			kfree(object);
+			return;
+		}
+	}
+}
+
+static void update_table(u32 saddr, u32 daddr,
+			 u16 sport, u16 dport, u32 curr_seq)
+{
+	u16 hash_key = crc16(cpu_saddr, cpu_daddr, cpu_sport, cpu_dport);
+	struct flow_info *object;
+
+	hash_for_each_possible(hash_table, object, hash_list, hash_key) {
+		if (object->saddr == saddr && object->daddr == daddr &&
+		    object->sport == sport && object->dport == dport &&
+		    seq_after(seq, object->curr_seq)) {
+			object->curr_seq = seq;
+			return;
+		}
+	}
+}
+
+static unsigned int
+inspect_sequence(unsigned int hooknum, struct sk_buff *skb,
+		 const struct net_device* in, const struct net_device *out,
+		 int (*okfn) (struct sk_buff*))
+{
+	struct iphdr *ip_header = (struct iphdr*) skb_network_header(skb);
+	if (unlikely(!ip_header) || ip_header->protocol != IPPROTO_TCP)
+		return NF_ACCEPT;
+
+	struct tcphdr *tcp_header = (struct tcphdr*) skb_transport_header(skb);
+	u16 sport = be16_to_cpu(tcp_header->source);
+	u16 dport = be16_to_cpu(tcp_header->dest);
+	if (param_port && sport != param_port && dport != param_port)
+		return NF_ACCEPT;
+
+	u32 saddr = be32_to_cpu(ip_header->saddr);
+	u32 daddr = be32_to_cpu(ip_header->daddr);
+	u32 seq = be32_to_cpu(tcp_header->seq);
+	
+	if (tcp_header->syn)
+		insert_to_table(saddr, daddr, source, dest, seq);
+	else if (tcp_header->fin)
+		delete_from_table(saddr, daddr, source, dest);
+	else
+		update_table(saddr, daddr, source, dest, seq);
+
+	return NF_ACCEPT;
+}
+
+static void recv_d2tcp_ctrl_msg(struct sk_buff *skb) {
+
+	struct nlmsghdr *nlh;
+	int pid;
+	struct sk_buff *skb_out;
+	struct ctrl_msg *recv_payload;
+	struct ctrl_msg echo_payload;
+
+	nlh = (struct nlmsghdr*) skb->data;
+	recv_payload = (struct ctrl_msg*) nlmsg_data(nlh);
+
+	u16 hash_key = crc16(recv_payload->saddr, recv_payload->daddr,
+			     recv_payload->sport, recv_payload->dport);
+	struct flow_info *object;
+	hash_for_each_possible(hash_table, object, hash_list, hash_key) {
+		if (object->saddr == recv_payload->saddr &&
+		    object->daddr == recv_payload->daddr &&
+		    object->sport == recv_payload->sport &&
+		    object->dport == recv_payload->dport) {
+		    	object->target_seq = object->seq + recv_payload->size;
+		    	object->end_time = /* TODO */ gettimeofnow() + recv_payload->time_to_ddl;
+			break;
+		}
+	}
+
+	echo_payload = *recv_payload;
+	pid = nlh->nlmsg_pid;
+	skb_out = nlmsg_new(sizeof(echo_payload), 0);
+	if(unlikely(!skb_out))
+		return;
+	nlh = nlmsg_put(skb_out, 0, 0, NLMSG_DONE, sizeof(echo_payload), 0);
+	NETLINK_CB(skb_out).dst_group = 0;
+	memcpy(nlmsg_data(nlh), &echo_payload, sizeof(echo_payload));
+	nlmsg_unicast(nl_sk, skb_out, pid);
+}
 
 static void dctcp_reset(const struct tcp_sock *tp, struct dctcp *ca)
 {
@@ -120,34 +289,6 @@ static void dctcp_init(struct sock *sk)
 	 */
 	inet_csk(sk)->icsk_ca_ops = &dctcp_reno;
 	INET_ECN_dontxmit(sk);
-}
-
-static void recv_d2tcp_ctrl_msg(struct sk_buff *skb) {
-
-	struct nlmsghdr *nlh;
-	int pid;
-	struct sk_buff *skb_out;
-	struct d2tcp_ctrl_msg *recv_payload;
-	struct d2tcp_ctrl_msg echo_payload; // echo to ACK the ctrl msg.
-
-	nlh = (struct nlmsghdr*) skb->data;
-	recv_payload = (struct d2tcp_ctrl_msg*) nlmsg_data(nlh);
-	// TODO: store value from recv_payload to hash table.
-	echo_payload.ddl = recv_payload->ddl;
-	echo_payload.total_num_bytes = recv_payload->total_num_bytes;
-	pid = nlh->nlmsg_pid;
-
-	skb_out = nlmsg_new(sizeof(struct d2tcp_ctrl_msg), 0);
-	if(unlikely(!skb_out))
-	{
-		printk(KERN_ERR "Failed to allocate new skb\n");
-		return;
-	}
-
-	nlh = nlmsg_put(skb_out, 0, 0, NLMSG_DONE, sizeof(struct d2tcp_ctrl_msg), 0);
-	NETLINK_CB(skb_out).dst_group = 0;
-	memcpy(nlmsg_data(nlh), &echo_payload, sizeof(struct d2tcp_ctrl_msg));
-	nlmsg_unicast(nl_sk, skb_out, pid);
 }
 
 /* Calculates p = alpha ^ d in D2TCP.
@@ -387,16 +528,24 @@ static struct tcp_congestion_ops dctcp_reno __read_mostly = {
 	.name		= "d2tcp-reno",
 };
 
+static struct nf_hook_ops nfho = {
+        .hook = inspect_sequence,
+        .hooknum = 3, // NF_IP_LOCAL_OUT,
+        .pf = PF_INET,
+        .priority = NF_IP_PRI_FIRST,
+};
+
 static int __init dctcp_register(void)
 {
 	struct netlink_kernel_cfg cfg = {
 		.input = recv_d2tcp_ctrl_msg,
 	};
 	nl_sk = netlink_kernel_create(&init_net, NETLINK_D2TCP, &cfg);
-	if (!nl_sk)
-	{
+	if (!nl_sk) {
 		printk(KERN_ALERT "Error creating socket.\n");
 	}
+
+	nf_register_hook(&nfho);
 
 	BUILD_BUG_ON(sizeof(struct dctcp) > ICSK_CA_PRIV_SIZE);
 	return tcp_register_congestion_control(&dctcp);
@@ -405,6 +554,7 @@ static int __init dctcp_register(void)
 static void __exit dctcp_unregister(void)
 {
 	netlink_kernel_release(nl_sk);
+	nf_unregister_hook(&nfho);
 	tcp_unregister_congestion_control(&dctcp);
 }
 
