@@ -44,8 +44,8 @@
 #include <linux/inet_diag.h>
 #include <linux/ip.h>
 #include <linux/kernel.h>
-#include <linux/mm.h>
 #include <linux/ktime.h>
+#include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/netlink.h>
@@ -79,7 +79,7 @@ struct ctrl_msg {
 	u16 dport;
 	u32 size;
 	u32 time_to_ddl;
-}
+};
 
 struct flow_info {
 	u32 saddr;
@@ -105,9 +105,9 @@ module_param(dctcp_clamp_alpha_on_loss, uint, 0644);
 MODULE_PARM_DESC(dctcp_clamp_alpha_on_loss,
 		 "parameter for clamping alpha on loss");
 
-int param_port __read_mostly = 0;
+unsigned short param_port __read_mostly = 0;
 MODULE_PARM_DESC(param_port, "Port to match (0=all)");
-module_param(param_port, int, 0);
+module_param(param_port, ushort, 0);
 
 static struct tcp_congestion_ops dctcp_reno;
 
@@ -142,8 +142,8 @@ static void insert_to_table(u32 saddr, u32 daddr,
 	hash_for_each_possible(hash_table, object, hash_list, hash_key) {
 		if (object->saddr == saddr && object->daddr == daddr &&
 		    object->sport == sport && object->dport == dport &&
-		    seq_after(seq, object->curr_seq)) {
-			object->curr_seq = seq;
+		    seq_after(curr_seq, object->curr_seq)) {
+			object->curr_seq = curr_seq;
 			return;
 		}
 	}
@@ -154,7 +154,7 @@ static void insert_to_table(u32 saddr, u32 daddr,
 		object->daddr = daddr;
 		object->sport = sport;
 		object->dport = dport;
-		object->curr_seq = seq;
+		object->curr_seq = curr_seq;
 		hash_add(hash_table, &(object->hash_list), hash_key); 
 	}
 }
@@ -165,8 +165,8 @@ static void delete_from_table(u32 saddr, u32 daddr, u16 sport, u16 dport)
 	struct flow_info *object;
 
 	hash_for_each_possible(hash_table, object, hash_list, hash_key) {
-		if (object->saddr == cpu_saddr && object->daddr == cpu_daddr &&
-		    object->sport == cpu_sport && object->dport == cpu_dport) {
+		if (object->saddr == saddr && object->daddr == daddr &&
+		    object->sport == sport && object->dport == dport) {
 			hash_del(&(object->hash_list));
 			kfree(object);
 			return;
@@ -177,14 +177,14 @@ static void delete_from_table(u32 saddr, u32 daddr, u16 sport, u16 dport)
 static void update_table(u32 saddr, u32 daddr,
 			 u16 sport, u16 dport, u32 curr_seq)
 {
-	u16 hash_key = crc16(cpu_saddr, cpu_daddr, cpu_sport, cpu_dport);
+	u16 hash_key = crc16(saddr, daddr, sport, dport);
 	struct flow_info *object;
 
 	hash_for_each_possible(hash_table, object, hash_list, hash_key) {
 		if (object->saddr == saddr && object->daddr == daddr &&
 		    object->sport == sport && object->dport == dport &&
-		    seq_after(seq, object->curr_seq)) {
-			object->curr_seq = seq;
+		    seq_after(curr_seq, object->curr_seq)) {
+			object->curr_seq = curr_seq;
 			return;
 		}
 	}
@@ -210,17 +210,17 @@ inspect_sequence(unsigned int hooknum, struct sk_buff *skb,
 	u32 seq = be32_to_cpu(tcp_header->seq);
 	
 	if (tcp_header->syn)
-		insert_to_table(saddr, daddr, source, dest, seq);
+		insert_to_table(saddr, daddr, sport, dport, seq);
 	else if (tcp_header->fin)
-		delete_from_table(saddr, daddr, source, dest);
+		delete_from_table(saddr, daddr, sport, dport);
 	else
-		update_table(saddr, daddr, source, dest, seq);
+		update_table(saddr, daddr, sport, dport, seq);
 
 	return NF_ACCEPT;
 }
 
-static void recv_d2tcp_ctrl_msg(struct sk_buff *skb) {
-
+static void recv_d2tcp_ctrl_msg(struct sk_buff *skb)
+{
 	struct nlmsghdr *nlh;
 	int pid;
 	struct sk_buff *skb_out;
@@ -238,8 +238,8 @@ static void recv_d2tcp_ctrl_msg(struct sk_buff *skb) {
 		    object->daddr == recv_payload->daddr &&
 		    object->sport == recv_payload->sport &&
 		    object->dport == recv_payload->dport) {
-		    	object->target_seq = object->seq + recv_payload->size;
-		    	object->end_time = /* TODO */ gettimeofnow() + recv_payload->time_to_ddl;
+		    	object->target_seq = object->curr_seq + recv_payload->size;
+		    	object->end_time = ktime_add_us(ktime_get(), recv_payload->time_to_ddl); // TODO: handle netlink delay here??
 			break;
 		}
 	}
