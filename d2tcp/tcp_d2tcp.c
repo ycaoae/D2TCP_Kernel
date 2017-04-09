@@ -105,7 +105,7 @@ module_param(dctcp_clamp_alpha_on_loss, uint, 0644);
 MODULE_PARM_DESC(dctcp_clamp_alpha_on_loss,
 		 "parameter for clamping alpha on loss");
 
-unsigned short param_port __read_mostly = 0;
+static unsigned short param_port __read_mostly = 0;
 MODULE_PARM_DESC(param_port, "Port to match (0=all)");
 module_param(param_port, ushort, 0);
 
@@ -113,7 +113,7 @@ static struct tcp_congestion_ops dctcp_reno;
 
 DEFINE_HASHTABLE(hash_table, 8);
 
-struct sock *nl_sk = NULL;
+static struct sock *nl_sk = NULL;
 
 static int seq_after(u32 seq1, u32 seq2)
 {
@@ -131,6 +131,23 @@ static u16 crc16(u32 saddr, u32 daddr, u16 sport, u16 dport)
 		hash_code = (hash_code << 8) ^
 			    CRC_HASH_TABLE[(hash_code >> 8) ^ byte_ptr[i]];
 	return hash_code;
+}
+
+static void print_table(void)
+{
+	int last_bkt = -1;
+	int curr_bkt;
+	struct flow_info *object;
+
+	hash_for_each(hash_table, curr_bkt, object, hash_list) {
+		if (curr_bkt != last_bkt) {
+			printk(KERN_INFO "In bucket %d:\n", curr_bkt);
+			last_bkt = curr_bkt;
+		}
+		printk(KERN_INFO "%u:%hu to %u:%hu, curr seq is %u\n",
+		       object->saddr, object->sport,
+		       object->daddr, object->dport, object->curr_seq);
+	}
 }
 
 static void insert_to_table(u32 saddr, u32 daddr,
@@ -208,13 +225,22 @@ inspect_sequence(unsigned int hooknum, struct sk_buff *skb,
 	u32 saddr = be32_to_cpu(ip_header->saddr);
 	u32 daddr = be32_to_cpu(ip_header->daddr);
 	u32 seq = be32_to_cpu(tcp_header->seq);
-	
-	if (tcp_header->syn)
+
+	if (tcp_header->syn) {
+		printk(KERN_INFO "Before SYN:\n");
+		print_table();
 		insert_to_table(saddr, daddr, sport, dport, seq);
-	else if (tcp_header->fin)
+		printk(KERN_INFO "After SYN:\n");
+		print_table();
+	} else if (tcp_header->fin) {
+		printk(KERN_INFO "Before FIN:\n");
+		print_table();
 		delete_from_table(saddr, daddr, sport, dport);
-	else
+		printk(KERN_INFO "After FIN:\n");
+		print_table();
+	} else {
 		update_table(saddr, daddr, sport, dport, seq);
+	}
 
 	return NF_ACCEPT;
 }
@@ -230,6 +256,9 @@ static void recv_d2tcp_ctrl_msg(struct sk_buff *skb)
 	nlh = (struct nlmsghdr*) skb->data;
 	recv_payload = (struct ctrl_msg*) nlmsg_data(nlh);
 
+	printk(KERN_INFO "Before netlink update:\n");
+	print_table();
+
 	u16 hash_key = crc16(recv_payload->saddr, recv_payload->daddr,
 			     recv_payload->sport, recv_payload->dport);
 	struct flow_info *object;
@@ -238,11 +267,14 @@ static void recv_d2tcp_ctrl_msg(struct sk_buff *skb)
 		    object->daddr == recv_payload->daddr &&
 		    object->sport == recv_payload->sport &&
 		    object->dport == recv_payload->dport) {
-		    	object->target_seq = object->curr_seq + recv_payload->size;
-		    	object->end_time = ktime_add_us(ktime_get(), recv_payload->time_to_ddl); // TODO: handle netlink delay here??
+			object->target_seq = object->curr_seq + recv_payload->size;
+			object->end_time = ktime_add_us(ktime_get(), recv_payload->time_to_ddl); // TODO: handle netlink delay here??
 			break;
 		}
 	}
+
+	printk(KERN_INFO "After netlink update:\n");
+	print_table();
 
 	echo_payload = *recv_payload;
 	pid = nlh->nlmsg_pid;
