@@ -17,8 +17,9 @@ struct ctrl_msg {
   uint32_t time_to_ddl;
 };
 
-int main()
-{
+int nl_send_d2tcp_ctrl_msg(uint32_t saddr, uint16_t sport, uint32_t daddr,
+    uint16_t dport, uint32_t size_in_bytes, uint32_t microsecs_to_ddl) {
+
   struct ctrl_msg request;
   struct ctrl_msg* echo;
   struct sockaddr_nl src_addr, dest_addr;
@@ -27,20 +28,11 @@ int main()
   int sock_fd;
   struct msghdr msg;
 
-  printf("Input source IP (unsigned int): ");
-  scanf("%u", &(request.saddr));
-  printf("Input source port (unsigned short): ");
-  scanf("%hu", &(request.sport));
-  printf("Input destination IP (unsigned int): ");
-  scanf("%u", &(request.daddr));
-  printf("Input destination port (unsigned short): ");
-  scanf("%hu", &(request.dport));
-  printf("Input number of microseconds to deadline: ");
-  scanf("%u", &(request.time_to_ddl));
-  printf("Input total number of bytes: ");
-  scanf("%u", &(request.size));
-
   sock_fd = socket(PF_NETLINK, SOCK_RAW, NETLINK_USER);
+  if (sock_fd < 0) {
+    return sock_fd;
+  }
+
   memset(&src_addr, 0, sizeof(src_addr));
   src_addr.nl_family = AF_NETLINK;
   src_addr.nl_pid = getpid();
@@ -50,6 +42,13 @@ int main()
   dest_addr.nl_family = AF_NETLINK;
   dest_addr.nl_pid = 0;
   dest_addr.nl_groups = 0;
+
+  request.saddr = saddr;
+  request.sport = sport;
+  request.daddr = daddr;
+  request.dport = dport;
+  request.size = size_in_bytes;
+  request.time_to_ddl = microsecs_to_ddl;
 
   nlh = (struct nlmsghdr*) malloc(NLMSG_SPACE(MAX_PAYLOAD));
   memset(nlh, 0, NLMSG_SPACE(MAX_PAYLOAD));
@@ -71,4 +70,28 @@ int main()
   printf("Check syslog for result.\n");
   close(sock_fd);
   return 0;
+}
+
+int main() {
+  uint32_t saddr;
+  uint32_t daddr;
+  uint16_t sport;
+  uint16_t dport;
+  uint32_t size;
+  uint32_t time_to_ddl;
+
+  printf("Input source IP (unsigned int): ");
+  scanf("%u", &saddr);
+  printf("Input source port (unsigned short): ");
+  scanf("%hu", &sport);
+  printf("Input destination IP (unsigned int): ");
+  scanf("%u", &daddr);
+  printf("Input destination port (unsigned short): ");
+  scanf("%hu", &dport);
+  printf("Input total number of bytes: ");
+  scanf("%u", &size);
+  printf("Input number of microseconds to deadline: ");
+  scanf("%u", &time_to_ddl);
+
+  return nl_send_d2tcp_ctrl_msg(saddr, sport, daddr, dport, size, time_to_ddl);
 }
