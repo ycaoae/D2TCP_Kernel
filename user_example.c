@@ -4,34 +4,48 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <time.h> // For creating random numbers only.
 
-#define NETLINK_D2TCP 31
 #define MAX_PAYLOAD 1024
+#define NETLINK_USER 31
 
-struct d2tcp_ctrl_msg {
-  uint32_t ddl;
-  uint32_t total_num_bytes;
+struct ctrl_msg {
+  uint32_t saddr;
+  uint32_t daddr;
+  uint16_t sport;
+  uint16_t dport;
+  uint32_t size;
+  uint32_t time_to_ddl;
 };
 
-void send_d2tcp_ctrl_msg(uint32_t deadline, uint32_t num_bytes) {
-
+int main()
+{
+  struct ctrl_msg request;
+  struct ctrl_msg* echo;
   struct sockaddr_nl src_addr, dest_addr;
   struct nlmsghdr* nlh = NULL;
   struct iovec iov;
   int sock_fd;
   struct msghdr msg;
-  struct d2tcp_ctrl_msg send_payload;
-  struct d2tcp_ctrl_msg* recv_payload;
 
-  if ((sock_fd = socket(PF_NETLINK, SOCK_RAW, NETLINK_D2TCP)) < 0) {
-    return;
-  }
+  printf("Input source IP (unsigned int): ");
+  scanf("%u", &(request.saddr));
+  printf("Input source port (unsigned short): ");
+  scanf("%hu", &(request.sport));
+  printf("Input destination IP (unsigned int): ");
+  scanf("%u", &(request.daddr));
+  printf("Input destination port (unsigned short): ");
+  scanf("%hu", &(request.dport));
+  printf("Input number of microseconds to deadline: ");
+  scanf("%u", &(request.time_to_ddl));
+  printf("Input total number of bytes: ");
+  scanf("%u", &(request.size));
 
+  sock_fd = socket(PF_NETLINK, SOCK_RAW, NETLINK_USER);
   memset(&src_addr, 0, sizeof(src_addr));
   src_addr.nl_family = AF_NETLINK;
   src_addr.nl_pid = getpid();
   bind(sock_fd, (struct sockaddr*) &src_addr, sizeof(src_addr));
+
   memset(&dest_addr, 0, sizeof(dest_addr));
   dest_addr.nl_family = AF_NETLINK;
   dest_addr.nl_pid = 0;
@@ -42,9 +56,7 @@ void send_d2tcp_ctrl_msg(uint32_t deadline, uint32_t num_bytes) {
   nlh->nlmsg_len = NLMSG_SPACE(MAX_PAYLOAD);
   nlh->nlmsg_pid = getpid();
   nlh->nlmsg_flags = 0;
-  send_payload.ddl = deadline;
-  send_payload.total_num_bytes = num_bytes;
-  memcpy(NLMSG_DATA(nlh), &send_payload, sizeof(send_payload));
+  memcpy(NLMSG_DATA(nlh), &request, sizeof(request));
 
   iov.iov_base = (void*) nlh;
   iov.iov_len = nlh->nlmsg_len;
@@ -54,16 +66,9 @@ void send_d2tcp_ctrl_msg(uint32_t deadline, uint32_t num_bytes) {
   msg.msg_iov = &iov;
   msg.msg_iovlen = 1;
 
-  printf("Sending message to kernel %d, %d\n", deadline, num_bytes);
   sendmsg(sock_fd, &msg, 0);
-  printf("Waiting for message from kernel\n");
   recvmsg(sock_fd, &msg, 0);
-  recv_payload = (struct d2tcp_ctrl_msg*) NLMSG_DATA(nlh);
-  printf("Received message payload: %d, %d\n", recv_payload->ddl, recv_payload->total_num_bytes);
+  printf("Check syslog for result.\n");
   close(sock_fd);
-}
-
-int main() {
-  srand(time(NULL));
-  send_d2tcp_ctrl_msg(rand() & 15, rand() & 15);
+  return 0;
 }
