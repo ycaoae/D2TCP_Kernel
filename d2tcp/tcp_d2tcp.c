@@ -269,6 +269,7 @@ static void recv_d2tcp_ctrl_msg(struct sk_buff *skb)
 		    object->dport == recv_payload->dport) {
 			object->target_seq = object->curr_seq + recv_payload->size;
 			object->end_time = ktime_add_us(ktime_get(), recv_payload->time_to_ddl); // TODO: handle netlink delay here??
+			printk(KERN_INFO "end_seq: %u\n", object->target_seq);
 			break;
 		}
 	}
@@ -344,13 +345,34 @@ static u32 dctcp_ssthresh(struct sock *sk)
 {
 	const struct dctcp *ca = inet_csk_ca(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
-	u32 p;
-	u16 d;
+	struct inet_sock *inet = inet_sk(sk);
 
-	d = 64;
-	d = min_t(u16, max_t(u16, d, 64), 256);	//ensure d in [64, 256] -> [0.5, 2]
-	p = d2tcp_exp(ca->dctcp_alpha, d);	//p = alpha ^ d
+	u32 saddr = be32_to_cpu(inet->inet_rcv_saddr);
+	u32 daddr = be32_to_cpu(inet->inet_daddr);
+	u16 sport = inet->inet_num;
+	u16 dport = be16_to_cpu(inet->inet_dport);
 
+	u16 hash_key = crc16(saddr, daddr, sport, dport);
+	struct flow_info *object;
+	u16 d = 128; // If hashed object not found, 128 is the default fall-back.
+
+	hash_for_each_possible(hash_table, object, hash_list, hash_key) {
+		if (object->saddr == saddr && object->daddr == daddr &&
+		    object->sport == sport && object->dport == dport) {
+			s64 remaining_time = ktime_ms_delta(object->end_time, ktime_get());
+			if (remaining_time <= 0) {
+				d = 256;
+				break;
+			}
+			u32 remaining_num_bytes = object->target_seq - ca->next_seq;
+			d = (128U * remaining_num_bytes) /
+			    (1125U * tp->snd_cwnd * remaining_time);
+			d = (d < 64) ? 64 : ((d > 256) ? 256 : d);
+			break;
+		}
+	}
+
+	u32 p = d2tcp_exp(ca->dctcp_alpha, d);
 	return max(tp->snd_cwnd - ((tp->snd_cwnd * p) >> 11U), 2U);
 	//return max(tp->snd_cwnd - ((tp->snd_cwnd * ca->dctcp_alpha) >> 11U), 2U);
 }
