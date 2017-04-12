@@ -133,6 +133,7 @@ static u16 crc16(u32 saddr, u32 daddr, u16 sport, u16 dport)
 	return hash_code;
 }
 
+#ifdef D2TCP_DEBUG
 static void print_table(void)
 {
 	int last_bkt = -1;
@@ -144,11 +145,12 @@ static void print_table(void)
 			printk(KERN_INFO "In bucket %d:\n", curr_bkt);
 			last_bkt = curr_bkt;
 		}
-		printk(KERN_INFO "%u:%hu to %u:%hu, curr seq is %u\n",
-		       object->saddr, object->sport,
-		       object->daddr, object->dport, object->curr_seq);
+		printk(KERN_INFO "%pI4h:%hu to %pI4h:%hu, curr seq is %u\n",
+		       &(object->saddr), object->sport,
+		       &(object->daddr), object->dport, object->curr_seq);
 	}
 }
+#endif
 
 static void insert_to_table(u32 saddr, u32 daddr,
 			    u16 sport, u16 dport, u32 curr_seq)
@@ -227,17 +229,25 @@ inspect_sequence(unsigned int hooknum, struct sk_buff *skb,
 	u32 seq = be32_to_cpu(tcp_header->seq);
 
 	if (tcp_header->syn) {
+	#ifdef D2TCP_DEBUG
 		printk(KERN_INFO "Before SYN:\n");
 		print_table();
+	#endif
 		insert_to_table(saddr, daddr, sport, dport, seq);
+	#ifdef D2TCP_DEBUG
 		printk(KERN_INFO "After SYN:\n");
 		print_table();
+	#endif
 	} else if (tcp_header->fin) {
+	#ifdef D2TCP_DEBUG
 		printk(KERN_INFO "Before FIN:\n");
 		print_table();
+	#endif
 		delete_from_table(saddr, daddr, sport, dport);
+	#ifdef D2TCP_DEBUG
 		printk(KERN_INFO "After FIN:\n");
 		print_table();
+	#endif
 	} else {
 		update_table(saddr, daddr, sport, dport, seq);
 	}
@@ -255,10 +265,10 @@ static void recv_d2tcp_ctrl_msg(struct sk_buff *skb)
 
 	nlh = (struct nlmsghdr*) skb->data;
 	recv_payload = (struct ctrl_msg*) nlmsg_data(nlh);
-
+#ifdef D2TCP_DEBUG
 	printk(KERN_INFO "Before netlink update:\n");
 	print_table();
-
+#endif
 	u16 hash_key = crc16(recv_payload->saddr, recv_payload->daddr,
 			     recv_payload->sport, recv_payload->dport);
 	struct flow_info *object;
@@ -269,14 +279,16 @@ static void recv_d2tcp_ctrl_msg(struct sk_buff *skb)
 		    object->dport == recv_payload->dport) {
 			object->target_seq = object->curr_seq + recv_payload->size;
 			object->end_time = ktime_add_us(ktime_get(), recv_payload->time_to_ddl); // TODO: handle netlink delay here??
-			printk(KERN_INFO "end_seq: %u\n", object->target_seq);
+		#ifdef D2TCP_DEBUG
+			printk(KERN_INFO "end_seq: %u; end_time: %lld\n", object->target_seq, ktime_to_us(object->end_time));
+		#endif
 			break;
 		}
 	}
-
+#ifdef D2TCP_DEBUG
 	printk(KERN_INFO "After netlink update:\n");
 	print_table();
-
+#endif
 	echo_payload = *recv_payload;
 	pid = nlh->nlmsg_pid;
 	skb_out = nlmsg_new(sizeof(echo_payload), 0);
@@ -347,9 +359,9 @@ static u32 dctcp_ssthresh(struct sock *sk)
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct inet_sock *inet = inet_sk(sk);
 
-	u32 saddr = be32_to_cpu(inet->inet_rcv_saddr);
+	u32 saddr = be32_to_cpu(inet->inet_saddr);
 	u32 daddr = be32_to_cpu(inet->inet_daddr);
-	u16 sport = inet->inet_num;
+	u16 sport = be16_to_cpu(inet->inet_sport);
 	u16 dport = be16_to_cpu(inet->inet_dport);
 
 	u16 hash_key = crc16(saddr, daddr, sport, dport);
@@ -359,20 +371,33 @@ static u32 dctcp_ssthresh(struct sock *sk)
 	hash_for_each_possible(hash_table, object, hash_list, hash_key) {
 		if (object->saddr == saddr && object->daddr == daddr &&
 		    object->sport == sport && object->dport == dport) {
-			s64 remaining_time = ktime_ms_delta(object->end_time, ktime_get());
-			if (remaining_time <= 0) {
-				d = 256;
+			s64 remaining_time = ktime_us_delta(object->end_time, ktime_get());
+			if (remaining_time <= 0)
 				break;
-			}
 			u32 remaining_num_bytes = object->target_seq - ca->next_seq;
-			d = (128U * remaining_num_bytes) /
-			    (1125U * tp->snd_cwnd * remaining_time);
+			d = ((tp->srtt_us * remaining_num_bytes) << 7) /
+			    (1125U * tp->snd_cwnd * remaining_time); // TODO: handle multiplication overflow?
 			d = (d < 64) ? 64 : ((d > 256) ? 256 : d);
+		#ifdef D2TCP_DEBUG
+			printk(KERN_INFO "ssthresh of %pI4h:%hu to %pI4h:%hu\n",
+			       &saddr, sport, &daddr, dport);
+			printk(KERN_INFO "time(end:now:left): %lld, %lld, %lld\n",
+			       ktime_to_us(object->end_time),
+			       ktime_to_us(ktime_get()), remaining_time);
+			printk(KERN_INFO "seq(end:now:left): %u, %u, %u\n",
+				object->target_seq, ca->next_seq,
+				remaining_num_bytes);
+			printk(KERN_INFO "cwnd: %u, rtt: %u\n",
+			       tp->snd_cwnd, tp->srtt_us);
+		#endif
 			break;
 		}
 	}
 
 	u32 p = d2tcp_exp(ca->dctcp_alpha, d);
+#ifdef D2TCP_DEBUG
+	printk(KERN_INFO "d: %hu, p: %u\n", d, p);
+#endif
 	return max(tp->snd_cwnd - ((tp->snd_cwnd * p) >> 11U), 2U);
 	//return max(tp->snd_cwnd - ((tp->snd_cwnd * ca->dctcp_alpha) >> 11U), 2U);
 }
