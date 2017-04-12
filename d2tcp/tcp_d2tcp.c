@@ -115,11 +115,6 @@ DEFINE_HASHTABLE(hash_table, 8);
 
 static struct sock *nl_sk = NULL;
 
-static int seq_after(u32 seq1, u32 seq2)
-{
-	return (s32) (seq1 - seq2) > 0;
-}
-
 static u16 crc16(u32 saddr, u32 daddr, u16 sport, u16 dport)
 {
 	u16 id_segments[6] = {saddr >> 16, saddr & 0xffff, sport,
@@ -133,36 +128,17 @@ static u16 crc16(u32 saddr, u32 daddr, u16 sport, u16 dport)
 	return hash_code;
 }
 
-#ifdef D2TCP_DEBUG
-static void print_table(void)
-{
-	int last_bkt = -1;
-	int curr_bkt;
-	struct flow_info *object;
-
-	hash_for_each(hash_table, curr_bkt, object, hash_list) {
-		if (curr_bkt != last_bkt) {
-			printk(KERN_INFO "In bucket %d:\n", curr_bkt);
-			last_bkt = curr_bkt;
-		}
-		printk(KERN_INFO "%pI4h:%hu to %pI4h:%hu, curr seq is %u\n",
-		       &(object->saddr), object->sport,
-		       &(object->daddr), object->dport, object->curr_seq);
-	}
-}
-#endif
-
-static void insert_to_table(u32 saddr, u32 daddr,
-			    u16 sport, u16 dport, u32 curr_seq)
+static void write_to_table(u32 saddr, u32 daddr,
+			   u16 sport, u16 dport, u32 curr_seq)
 {
 	u16 hash_key = crc16(saddr, daddr, sport, dport);
 	struct flow_info *object;
 
 	hash_for_each_possible(hash_table, object, hash_list, hash_key) {
 		if (object->saddr == saddr && object->daddr == daddr &&
-		    object->sport == sport && object->dport == dport &&
-		    seq_after(curr_seq, object->curr_seq)) {
-			object->curr_seq = curr_seq;
+		    object->sport == sport && object->dport == dport) {
+			object->curr_seq = (s32) (curr_seq - object->curr_seq) > 0 ?
+					   curr_seq : object->curr_seq;
 			return;
 		}
 	}
@@ -174,7 +150,12 @@ static void insert_to_table(u32 saddr, u32 daddr,
 		object->sport = sport;
 		object->dport = dport;
 		object->curr_seq = curr_seq;
-		hash_add(hash_table, &(object->hash_list), hash_key); 
+		object->end_time = ns_to_ktime(0);
+		hash_add(hash_table, &(object->hash_list), hash_key);
+	#ifdef D2TCP_DEBUG
+		printk(KERN_INFO "Insertion: %pI4h:%hu to %pI4h:%hu, curr seq: %u\n",
+		       &saddr, sport, &daddr, dport, curr_seq);
+	#endif
 	}
 }
 
@@ -186,24 +167,12 @@ static void delete_from_table(u32 saddr, u32 daddr, u16 sport, u16 dport)
 	hash_for_each_possible(hash_table, object, hash_list, hash_key) {
 		if (object->saddr == saddr && object->daddr == daddr &&
 		    object->sport == sport && object->dport == dport) {
+		#ifdef D2TCP_DEBUG
+			printk(KERN_INFO "Deletion: %pI4h:%hu to %pI4h:%hu\n",
+			       &saddr, sport, &daddr, dport);
+		#endif
 			hash_del(&(object->hash_list));
 			kfree(object);
-			return;
-		}
-	}
-}
-
-static void update_table(u32 saddr, u32 daddr,
-			 u16 sport, u16 dport, u32 curr_seq)
-{
-	u16 hash_key = crc16(saddr, daddr, sport, dport);
-	struct flow_info *object;
-
-	hash_for_each_possible(hash_table, object, hash_list, hash_key) {
-		if (object->saddr == saddr && object->daddr == daddr &&
-		    object->sport == sport && object->dport == dport &&
-		    seq_after(curr_seq, object->curr_seq)) {
-			object->curr_seq = curr_seq;
 			return;
 		}
 	}
@@ -226,32 +195,13 @@ inspect_sequence(unsigned int hooknum, struct sk_buff *skb,
 
 	u32 saddr = be32_to_cpu(ip_header->saddr);
 	u32 daddr = be32_to_cpu(ip_header->daddr);
-	u32 seq = be32_to_cpu(tcp_header->seq);
-
-	if (tcp_header->syn) {
-	#ifdef D2TCP_DEBUG
-		printk(KERN_INFO "Before SYN:\n");
-		print_table();
-	#endif
-		insert_to_table(saddr, daddr, sport, dport, seq);
-	#ifdef D2TCP_DEBUG
-		printk(KERN_INFO "After SYN:\n");
-		print_table();
-	#endif
-	} else if (tcp_header->fin) {
-	#ifdef D2TCP_DEBUG
-		printk(KERN_INFO "Before FIN:\n");
-		print_table();
-	#endif
+	if (tcp_header->fin) {
 		delete_from_table(saddr, daddr, sport, dport);
-	#ifdef D2TCP_DEBUG
-		printk(KERN_INFO "After FIN:\n");
-		print_table();
-	#endif
-	} else {
-		update_table(saddr, daddr, sport, dport, seq);
+		return NF_ACCEPT;
 	}
 
+	u32 seq = be32_to_cpu(tcp_header->seq);
+	write_to_table(saddr, daddr, sport, dport, seq);
 	return NF_ACCEPT;
 }
 
@@ -265,10 +215,7 @@ static void recv_d2tcp_ctrl_msg(struct sk_buff *skb)
 
 	nlh = (struct nlmsghdr*) skb->data;
 	recv_payload = (struct ctrl_msg*) nlmsg_data(nlh);
-#ifdef D2TCP_DEBUG
-	printk(KERN_INFO "Before netlink update:\n");
-	print_table();
-#endif
+
 	u16 hash_key = crc16(recv_payload->saddr, recv_payload->daddr,
 			     recv_payload->sport, recv_payload->dport);
 	struct flow_info *object;
@@ -278,17 +225,22 @@ static void recv_d2tcp_ctrl_msg(struct sk_buff *skb)
 		    object->sport == recv_payload->sport &&
 		    object->dport == recv_payload->dport) {
 			object->target_seq = object->curr_seq + recv_payload->size;
-			object->end_time = ktime_add_us(ktime_get(), recv_payload->time_to_ddl); // TODO: handle netlink delay here??
+			object->end_time = ktime_add_us(ktime_get(), recv_payload->time_to_ddl); // TODO: handle netlink delay here?
 		#ifdef D2TCP_DEBUG
-			printk(KERN_INFO "end_seq: %u; end_time: %lld\n", object->target_seq, ktime_to_us(object->end_time));
+			printk(KERN_INFO "nlmsg: %pI4h:%hu to %pI4h:%hu\n",
+			       &(object->saddr), object->sport,
+			       &(object->daddr), object->dport);
+			printk(KERN_INFO "time(now:given:ddl): %lld, %lld, %lld\n",
+			       ktime_to_us(ktime_get()), recv_payload->time_to_ddl,
+			       ktime_to_us(object->end_time));
+			printk(KERN_INFO "seq(curr:size:target): %u, %u, %u\n",
+			       object->curr_seq, recv_payload->size,
+			       object->target_seq);
 		#endif
 			break;
 		}
 	}
-#ifdef D2TCP_DEBUG
-	printk(KERN_INFO "After netlink update:\n");
-	print_table();
-#endif
+
 	echo_payload = *recv_payload;
 	pid = nlh->nlmsg_pid;
 	skb_out = nlmsg_new(sizeof(echo_payload), 0);
@@ -364,6 +316,11 @@ static u32 dctcp_ssthresh(struct sock *sk)
 	u16 sport = be16_to_cpu(inet->inet_sport);
 	u16 dport = be16_to_cpu(inet->inet_dport);
 
+#ifdef D2TCP_DEBUG
+	printk(KERN_INFO "ssthresh: %pI4h:%hu to %pI4h:%hu\n",
+	       &saddr, sport, &daddr, dport);
+#endif
+
 	u16 hash_key = crc16(saddr, daddr, sport, dport);
 	struct flow_info *object;
 	u16 d = 128; // If hashed object not found, 128 is the default fall-back.
@@ -371,22 +328,26 @@ static u32 dctcp_ssthresh(struct sock *sk)
 	hash_for_each_possible(hash_table, object, hash_list, hash_key) {
 		if (object->saddr == saddr && object->daddr == daddr &&
 		    object->sport == sport && object->dport == dport) {
-			s64 remaining_time = ktime_us_delta(object->end_time, ktime_get());
-			if (remaining_time <= 0)
-				break;
-			u32 remaining_num_bytes = object->target_seq - ca->next_seq;
-			d = ((tp->srtt_us * remaining_num_bytes) << 7) /
-			    (1125U * tp->snd_cwnd * remaining_time); // TODO: handle multiplication overflow?
-			d = (d < 64) ? 64 : ((d > 256) ? 256 : d);
 		#ifdef D2TCP_DEBUG
-			printk(KERN_INFO "ssthresh of %pI4h:%hu to %pI4h:%hu\n",
-			       &saddr, sport, &daddr, dport);
-			printk(KERN_INFO "time(end:now:left): %lld, %lld, %lld\n",
-			       ktime_to_us(object->end_time),
-			       ktime_to_us(ktime_get()), remaining_time);
-			printk(KERN_INFO "seq(end:now:left): %u, %u, %u\n",
-				object->target_seq, ca->next_seq,
-				remaining_num_bytes);
+			printk(KERN_INFO "entry found\n");
+		#endif
+			s64 remaining_time = ktime_us_delta(object->end_time, ktime_get());
+			if (remaining_time <= 0) // No deadline or missed deadline.
+				break;
+
+			u32 remaining_num_bytes = object->target_seq - ca->next_seq;
+			u64 dividend = (tp->srtt_us * remaining_num_bytes) << 7;
+			u32 divisor = tp->snd_cwnd * remaining_time * 1125U;
+			d = do_div(dividend, divisor);
+			d = (d < 64) ? 64 : ((d > 256) ? 256 : d);
+
+		#ifdef D2TCP_DEBUG
+			printk(KERN_INFO "time(now:left:ddl): %lld, %lld, %lld\n",
+			       ktime_to_us(ktime_get()), remaining_time,
+			       ktime_to_us(object->end_time));
+			printk(KERN_INFO "seq(curr:left:target): %u, %u, %u\n",
+				ca->next_seq, remaining_num_bytes,
+				object->target_seq);
 			printk(KERN_INFO "cwnd: %u, rtt: %u\n",
 			       tp->snd_cwnd, tp->srtt_us);
 		#endif
