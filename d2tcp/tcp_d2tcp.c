@@ -251,7 +251,7 @@ static void recv_d2tcp_ctrl_msg(struct sk_buff *skb)
 			printk(KERN_INFO "nlmsg: %pI4h:%hu to %pI4h:%hu\n",
 			       &(object->saddr), object->sport,
 			       &(object->daddr), object->dport);
-			printk(KERN_INFO "time(now:given:ddl): %lld, %lld, %lld\n",
+			printk(KERN_INFO "time(now:given:ddl): %lld, %u, %lld\n",
 			       ktime_to_us(ktime_get()), recv_payload->time_to_ddl,
 			       ktime_to_us(object->end_time));
 			printk(KERN_INFO "seq(curr:size:target): %u, %u, %u\n",
@@ -354,19 +354,8 @@ static u32 dctcp_ssthresh(struct sock *sk)
 				break;
 
 			u32 remaining_num_bytes = object->target_seq - ca->next_seq;
-			u64 dividend = (tp->srtt_us * remaining_num_bytes) << 7;
-			u64 divisor = tp->snd_cwnd * remaining_time * 1125U;
-
-			if (divisor > 0xffffffff) {
-				u64 dividend_shifted = dividend >> 25;
-				u32 divisor_shifted = divisor >> 25;
-				d = do_div(dividend_shifted, divisor_shifted);
-			} else {
-				u32 divisor_u32 = divisor;
-				d = do_div(dividend, divisor_u32);
-			}
-			
-			d = (d < 64) ? 64 : ((d > 256) ? 256 : d);
+			u64 dividend = ((u64) tp->srtt_us * (u64) remaining_num_bytes) << 7;
+			u64 divisor = (u64) tp->snd_cwnd * (u64) remaining_time * (u64) 1125;
 
 		#ifdef D2TCP_DEBUG
 			printk(KERN_INFO "time(now:left:ddl): %lld, %lld, %lld\n",
@@ -377,7 +366,31 @@ static u32 dctcp_ssthresh(struct sock *sk)
 				object->target_seq);
 			printk(KERN_INFO "cwnd: %u, rtt: %u\n",
 			       tp->snd_cwnd, tp->srtt_us);
+			printk(KERN_INFO "%llu / %llu", dividend, divisor);
 		#endif
+
+			if (divisor > (u64) 4294967295) {
+				dividend = dividend >> 25;
+				u32 divisor_shifted = divisor >> 25;
+			#ifdef D2TCP_DEBUG
+				printk(" = %llu / %u", dividend, divisor_shifted);
+			#endif
+				do_div(dividend, divisor_shifted);
+			#ifdef D2TCP_DEBUG
+				printk(" = %llu\n", dividend);
+			#endif
+			} else {
+				u32 divisor_u32 = divisor;
+			#ifdef D2TCP_DEBUG
+				printk(" = %llu / %u", dividend, divisor_u32);
+			#endif
+				do_div(dividend, divisor_u32);
+			#ifdef D2TCP_DEBUG
+				printk(" = %llu\n", dividend);
+			#endif
+			}
+			d = (dividend < 64) ? 64 : ((dividend > 256) ? 256 : dividend);
+
 			break;
 		}
 	}
