@@ -152,9 +152,26 @@ static void write_to_table(u32 saddr, u32 daddr,
 		object->curr_seq = curr_seq;
 		object->end_time = ns_to_ktime(0);
 		hash_add(hash_table, &(object->hash_list), hash_key);
+
 	#ifdef D2TCP_DEBUG
-		printk(KERN_INFO "Insertion: %pI4h:%hu to %pI4h:%hu, curr seq: %u\n",
-		       &saddr, sport, &daddr, dport, curr_seq);
+		ktime_t time_now = ktime_get();
+		if (saddr == 3232235817U && // 192.168.1.41
+		    daddr == 3232235816U && dport == 5001U) { // 192.168.1.40:5001
+			object->end_time = ktime_add_us(time_now, 20000000); // 20s (more than enough)
+			object->target_seq = curr_seq + 629145600U; // 600MBytes (take more than 10s)
+
+		} else if (saddr == 3232235818U && // 192.168.1.42
+			   daddr == 3232235816U && dport == 5001U) { // 192.168.1.40:5001
+			object->end_time = ktime_add_us(time_now, 10001000); // 10s
+			object->target_seq = curr_seq + 838860800U; // 800MBytes (640Mbps needed)
+		}
+
+		printk(KERN_INFO "Insertion: %pI4h:%hu to %pI4h:%hu\n",
+		       &saddr, sport, &daddr, dport);
+		printk(KERN_INFO "time(now:ddl): %lld, %lld\n",
+		       ktime_to_us(time_now), ktime_to_us(object->end_time));
+		printk(KERN_INFO "seq(curr:target): %u, %u\n",
+		       object->curr_seq, object->target_seq);
 	#endif
 	}
 }
@@ -170,6 +187,10 @@ static void delete_from_table(u32 saddr, u32 daddr, u16 sport, u16 dport)
 		#ifdef D2TCP_DEBUG
 			printk(KERN_INFO "Deletion: %pI4h:%hu to %pI4h:%hu\n",
 			       &saddr, sport, &daddr, dport);
+			printk(KERN_INFO "time(now:ddl): %lld, %lld\n",
+			       ktime_to_us(ktime_get()), ktime_to_us(object->end_time));
+			printk(KERN_INFO "seq(curr:target): %u, %u\n",
+			       object->curr_seq, object->target_seq);
 		#endif
 			hash_del(&(object->hash_list));
 			kfree(object);
@@ -328,17 +349,23 @@ static u32 dctcp_ssthresh(struct sock *sk)
 	hash_for_each_possible(hash_table, object, hash_list, hash_key) {
 		if (object->saddr == saddr && object->daddr == daddr &&
 		    object->sport == sport && object->dport == dport) {
-		#ifdef D2TCP_DEBUG
-			printk(KERN_INFO "entry found\n");
-		#endif
 			s64 remaining_time = ktime_us_delta(object->end_time, ktime_get());
 			if (remaining_time <= 0) // No deadline or missed deadline.
 				break;
 
 			u32 remaining_num_bytes = object->target_seq - ca->next_seq;
 			u64 dividend = (tp->srtt_us * remaining_num_bytes) << 7;
-			u32 divisor = tp->snd_cwnd * remaining_time * 1125U;
-			d = do_div(dividend, divisor);
+			u64 divisor = tp->snd_cwnd * remaining_time * 1125U;
+
+			if (divisor > 0xffffffff) {
+				u64 dividend_shifted = dividend >> 25;
+				u32 divisor_shifted = divisor >> 25;
+				d = do_div(dividend_shifted, divisor_shifted);
+			} else {
+				u32 divisor_u32 = divisor;
+				d = do_div(dividend, divisor_u32);
+			}
+			
 			d = (d < 64) ? 64 : ((d > 256) ? 256 : d);
 
 		#ifdef D2TCP_DEBUG
@@ -357,7 +384,7 @@ static u32 dctcp_ssthresh(struct sock *sk)
 
 	u32 p = d2tcp_exp(ca->dctcp_alpha, d);
 #ifdef D2TCP_DEBUG
-	printk(KERN_INFO "d: %hu, p: %u\n", d, p);
+	printk(KERN_INFO "alpha: %u, d: %hu, p: %u\n", ca->dctcp_alpha, d, p);
 #endif
 	return max(tp->snd_cwnd - ((tp->snd_cwnd * p) >> 11U), 2U);
 	//return max(tp->snd_cwnd - ((tp->snd_cwnd * ca->dctcp_alpha) >> 11U), 2U);
