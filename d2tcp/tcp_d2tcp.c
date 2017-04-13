@@ -157,7 +157,7 @@ static void write_to_table(u32 saddr, u32 daddr,
 		ktime_t time_now = ktime_get();
 		if (saddr == 3232235817U && // 192.168.1.41
 		    daddr == 3232235816U && dport == 5001U) { // 192.168.1.40:5001
-			object->end_time = ktime_add_us(time_now, 20000000); // 20s (more than enough)
+			object->end_time = ktime_add_us(time_now, 500000000); // 500s
 			object->target_seq = curr_seq + 629145600U; // 600MBytes (take more than 10s)
 
 		} else if (saddr == 3232235818U && // 192.168.1.42
