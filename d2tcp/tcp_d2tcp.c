@@ -42,17 +42,13 @@
 
 #include <linux/hashtable.h>
 #include <linux/inet_diag.h>
-#include <linux/ip.h>
 #include <linux/kernel.h>
 #include <linux/ktime.h>
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/netlink.h>
-#include <linux/skbuff.h>
-#include <linux/tcp.h>
 #include <linux/types.h>
-#include <net/sock.h>
 #include <net/tcp.h>
 
 #include "crc_table.h"
@@ -152,27 +148,6 @@ static void write_to_table(u32 saddr, u32 daddr,
 		object->curr_seq = curr_seq;
 		object->end_time = ns_to_ktime(0);
 		hash_add(hash_table, &(object->hash_list), hash_key);
-
-	#ifdef D2TCP_DEBUG
-		ktime_t time_now = ktime_get();
-		if (saddr == 3232235817U && // 192.168.1.41
-		    daddr == 3232235816U && dport == 5001U) { // 192.168.1.40:5001
-			object->end_time = ktime_add_us(time_now, 500000000); // 500s
-			object->target_seq = curr_seq + 629145600U; // 600MBytes (take more than 10s)
-
-		} else if (saddr == 3232235818U && // 192.168.1.42
-			   daddr == 3232235816U && dport == 5001U) { // 192.168.1.40:5001
-			object->end_time = ktime_add_us(time_now, 10001000); // 10s
-			object->target_seq = curr_seq + 838860800U; // 800MBytes (640Mbps needed)
-		}
-
-		printk(KERN_INFO "Insertion: %pI4h:%hu to %pI4h:%hu\n",
-		       &saddr, sport, &daddr, dport);
-		printk(KERN_INFO "time(now:ddl): %lld, %lld\n",
-		       ktime_to_us(time_now), ktime_to_us(object->end_time));
-		printk(KERN_INFO "seq(curr:target): %u, %u\n",
-		       object->curr_seq, object->target_seq);
-	#endif
 	}
 }
 
@@ -184,14 +159,6 @@ static void delete_from_table(u32 saddr, u32 daddr, u16 sport, u16 dport)
 	hash_for_each_possible(hash_table, object, hash_list, hash_key) {
 		if (object->saddr == saddr && object->daddr == daddr &&
 		    object->sport == sport && object->dport == dport) {
-		#ifdef D2TCP_DEBUG
-			printk(KERN_INFO "Deletion: %pI4h:%hu to %pI4h:%hu\n",
-			       &saddr, sport, &daddr, dport);
-			printk(KERN_INFO "time(now:ddl): %lld, %lld\n",
-			       ktime_to_us(ktime_get()), ktime_to_us(object->end_time));
-			printk(KERN_INFO "seq(curr:target): %u, %u\n",
-			       object->curr_seq, object->target_seq);
-		#endif
 			hash_del(&(object->hash_list));
 			kfree(object);
 			return;
@@ -201,7 +168,7 @@ static void delete_from_table(u32 saddr, u32 daddr, u16 sport, u16 dport)
 
 static unsigned int
 inspect_sequence(unsigned int hooknum, struct sk_buff *skb,
-		 const struct net_device* in, const struct net_device *out,
+		 const struct net_device *in, const struct net_device *out,
 		 int (*okfn) (struct sk_buff*))
 {
 	struct iphdr *ip_header = (struct iphdr*) skb_network_header(skb);
@@ -246,7 +213,7 @@ static void recv_d2tcp_ctrl_msg(struct sk_buff *skb)
 		    object->sport == recv_payload->sport &&
 		    object->dport == recv_payload->dport) {
 			object->target_seq = object->curr_seq + recv_payload->size;
-			object->end_time = ktime_add_us(ktime_get(), recv_payload->time_to_ddl); // TODO: handle netlink delay here?
+			object->end_time = ktime_add_us(ktime_get(), recv_payload->time_to_ddl);
 		#ifdef D2TCP_DEBUG
 			printk(KERN_INFO "nlmsg: %pI4h:%hu to %pI4h:%hu\n",
 			       &(object->saddr), object->sport,
@@ -354,7 +321,7 @@ static u32 dctcp_ssthresh(struct sock *sk)
 				break;
 
 			u32 remaining_num_bytes = object->target_seq - ca->next_seq;
-			u64 dividend = ((u64) tp->srtt_us * (u64) remaining_num_bytes) << 7;
+			u64 dividend = (((u64) tp->srtt_us >> 3) * (u64) remaining_num_bytes) << 7;
 			u64 divisor = (u64) tp->snd_cwnd * (u64) remaining_time * (u64) 1125;
 
 		#ifdef D2TCP_DEBUG
@@ -365,13 +332,15 @@ static u32 dctcp_ssthresh(struct sock *sk)
 				ca->next_seq, remaining_num_bytes,
 				object->target_seq);
 			printk(KERN_INFO "cwnd: %u, rtt: %u\n",
-			       tp->snd_cwnd, tp->srtt_us);
+			       tp->snd_cwnd, tp->srtt_us >> 3);
 			printk(KERN_INFO "%llu / %llu", dividend, divisor);
 		#endif
 
-			if (divisor > (u64) 4294967295) {
-				dividend = dividend >> 25;
-				u32 divisor_shifted = divisor >> 25;
+			while (divisor > (u64) 4294967295) {
+				dividend = dividend >> 1;
+				divisor = divisor >> 1;
+			}
+				u32 divisor_shifted = divisor;
 			#ifdef D2TCP_DEBUG
 				printk(" = %llu / %u", dividend, divisor_shifted);
 			#endif
@@ -379,18 +348,7 @@ static u32 dctcp_ssthresh(struct sock *sk)
 			#ifdef D2TCP_DEBUG
 				printk(" = %llu\n", dividend);
 			#endif
-			} else {
-				u32 divisor_u32 = divisor;
-			#ifdef D2TCP_DEBUG
-				printk(" = %llu / %u", dividend, divisor_u32);
-			#endif
-				do_div(dividend, divisor_u32);
-			#ifdef D2TCP_DEBUG
-				printk(" = %llu\n", dividend);
-			#endif
-			}
 			d = (dividend < 64) ? 64 : ((dividend > 256) ? 256 : dividend);
-
 			break;
 		}
 	}
@@ -610,9 +568,9 @@ static struct tcp_congestion_ops dctcp_reno __read_mostly = {
 
 static struct nf_hook_ops nfho = {
         .hook = inspect_sequence,
-        .hooknum = 3, // NF_IP_LOCAL_OUT,
+        .hooknum = NF_INET_LOCAL_OUT,
         .pf = PF_INET,
-        .priority = NF_IP_PRI_FIRST,
+        .priority = NF_IP_PRI_FIRST
 };
 
 static int __init dctcp_register(void)
