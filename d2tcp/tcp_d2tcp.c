@@ -336,7 +336,7 @@ static u32 dctcp_ssthresh(struct sock *sk)
 			printk(KERN_INFO "%llu / %llu", dividend, divisor);
 		#endif
 
-			while (divisor > (u64) 4294967295) {
+			while (divisor > (u64) 0xffffffff) {
 				dividend = dividend >> 1;
 				divisor = divisor >> 1;
 			}
